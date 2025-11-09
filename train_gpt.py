@@ -798,7 +798,90 @@ class AttnArgs:
     sin: torch.Tensor
     attn_scale: float
 
-flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+# flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+def manual_flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+                                  causal=False, softmax_scale=None, window_size=None):
+    """
+    Manual implementation of variable-length flash attention using PyTorch's native SDPA.
+    This avoids needing flash-attn package installation.
+    Note: This function processes sequences sequentially and may be slower than flash-attn.
+    """
+    # Ensure cu_seqlens are on the same device as q
+    if cu_seqlens_q.device != q.device:
+        cu_seqlens_q = cu_seqlens_q.to(q.device)
+    if cu_seqlens_k.device != q.device:
+        cu_seqlens_k = cu_seqlens_k.to(q.device)
+
+    # Unpack window_size if provided
+    window_size_left = window_size[0] if window_size is not None and window_size[0] > 0 else None
+    window_size_right = window_size[1] if window_size is not None and window_size[1] > 0 else None
+
+    # Convert cu_seqlens to list of sequence lengths
+    seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+    seqlens_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+
+    # Process each sequence separately
+    num_seqs = seqlens_q.shape[0]
+    outputs = []
+    q_offset = 0
+    k_offset = 0
+
+    # Process sequences - we need to use a loop with .item() calls
+    # The dynamic marking above should help torch.compile handle this
+    for i in range(num_seqs):
+        seqlen_q = int(seqlens_q[i].item())
+        seqlen_k = int(seqlens_k[i].item())
+
+        q_seq = q[q_offset:q_offset + seqlen_q]  # [seqlen_q, num_heads, head_dim]
+        k_seq = k[k_offset:k_offset + seqlen_k]  # [seqlen_k, num_heads, head_dim]
+        v_seq = v[k_offset:k_offset + seqlen_k]  # [seqlen_k, num_heads, head_dim]
+
+        # Reshape for SDPA: [seqlen, num_heads, head_dim] -> [1, num_heads, seqlen, head_dim]
+        q_seq = q_seq.transpose(0, 1).unsqueeze(0)  # [1, num_heads, seqlen_q, head_dim]
+        k_seq = k_seq.transpose(0, 1).unsqueeze(0)  # [1, num_heads, seqlen_k, head_dim]
+        v_seq = v_seq.transpose(0, 1).unsqueeze(0)  # [1, num_heads, seqlen_k, head_dim]
+
+        # Create causal mask if needed
+        attn_mask = None
+        if causal:
+            # Create a causal mask: lower triangular
+            mask = torch.triu(torch.ones(seqlen_q, seqlen_k, device=q.device, dtype=torch.bool), diagonal=1)
+            attn_mask = mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seqlen_q, seqlen_k]
+
+        # Apply window size mask if specified (block-sparse attention)
+        if window_size_left is not None or window_size_right is not None:
+            if attn_mask is None:
+                attn_mask = torch.zeros(seqlen_q, seqlen_k, device=q.device, dtype=torch.bool).unsqueeze(0).unsqueeze(0)
+
+            row_indices = torch.arange(seqlen_q, device=q.device).unsqueeze(1)
+            col_indices = torch.arange(seqlen_k, device=q.device).unsqueeze(0)
+
+            if window_size_left is not None:
+                # Mask positions more than window_size_left to the left
+                attn_mask = attn_mask | (col_indices < (row_indices - window_size_left))
+            if window_size_right is not None:
+                # Mask positions more than window_size_right to the right
+                attn_mask = attn_mask | (col_indices > (row_indices + window_size_right))
+
+        # Use native scaled_dot_product_attention
+        # Note: is_causal and attn_mask are mutually exclusive in PyTorch
+        use_causal = causal and attn_mask is None
+        out = F.scaled_dot_product_attention(
+            q_seq, k_seq, v_seq,
+            attn_mask=attn_mask if not use_causal else None,
+            scale=softmax_scale,
+            is_causal=use_causal,
+        )
+
+        # Reshape back: [1, num_heads, seqlen_q, head_dim] -> [seqlen_q, num_heads, head_dim]
+        out = out.squeeze(0).transpose(0, 1)
+        outputs.append(out)
+
+        q_offset += seqlen_q
+        k_offset += seqlen_k
+
+    # Concatenate all sequences
+    return torch.cat(outputs, dim=0)
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int):
@@ -846,10 +929,14 @@ class CausalSelfAttention(nn.Module):
 
         max_len = args.train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
 
-        # use flash_attn over flex_attn @varunneal. flash_attn_varlen suggested by @YouJiacheng
-        y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
-                                                        max_seqlen_q=max_len, max_seqlen_k=max_len,
-                                                        causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0))
+        # # use flash_attn over flex_attn @varunneal. flash_attn_varlen suggested by @YouJiacheng
+        # y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
+        #                                                 max_seqlen_q=max_len, max_seqlen_k=max_len,
+        #                                                 causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0))
+        # Manual implementation of variable-length attention (avoids flash-attn dependency)
+        y = manual_flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
+                                          max_seqlen_q=max_len, max_seqlen_k=max_len,
+                                          causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0))
         y = y.view(B, T, self.num_heads, self.head_dim)
         y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate.weight.size(-1)])).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
@@ -1202,9 +1289,9 @@ class Hyperparameters:
     train_files: str = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
     val_files: str = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    train_batch_size: int = 2048 * 16 * 8
-    train_max_seq_len: int = 128 * 16
-    val_batch_size: int = 4 * 64 * 1024 * 8
+    train_batch_size: int = 2048 * 8 * 2  # Further reduced: 32768 tokens (was 262144); jovsa change
+    train_max_seq_len: int = 128 * 4  # Further reduced: 512 tokens (was 2048); jovsa change
+    val_batch_size: int = 4 * 64 * 1024  # Further reduced: 262144 tokens (was 2097152); jovsa change
     # optimization
     num_scheduled_iterations: int = 2245  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
@@ -1230,7 +1317,8 @@ args.val_files = os.path.join(data_path, args.val_files)
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
 assert 8 % world_size == 0, "world_size must be a divisor of 8"
-grad_accum_steps = 8 // world_size
+# Increase grad_accum_steps significantly to maintain effective batch size after reducing train_batch_size
+grad_accum_steps = 32 // world_size  # Increased from 8 to 32 to compensate for reduced batch size; jovsa change
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
@@ -1358,7 +1446,9 @@ def step_optimizers(step: int, optimizers, model):
             optimizer.step()
         model.zero_grad(set_to_none=True)
 
-model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
+# Compile with fullgraph=False to allow graph breaks for variable-length attention
+# This is necessary because manual_flash_attn_varlen_func uses data-dependent operations
+model: nn.Module = torch.compile(model, dynamic=False, fullgraph=False); # jovsa change
 
 ########################################
 #            Warmup kernels            #
